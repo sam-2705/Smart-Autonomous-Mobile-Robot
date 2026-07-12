@@ -1,0 +1,194 @@
+"""
+  maze_solver.py
+  "Smart Scan" Evasion. 
+  When blocked, it physically turns Left and Right to find an open path.
+"""
+
+import cv2
+import numpy as np
+import serial
+import time
+
+print(">>> SUCCESS: Python is reading the file!")
+
+ARDUINO_PORT = "/dev/ttyACM0"   
+BAUD_RATE = 9600
+CAMERA_INDEX = 0
+SEND_INTERVAL = 0.05   
+
+def main():
+    try:
+        arduino = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0.05)
+        time.sleep(2)  
+        print("Connected to Arduino.")
+    except Exception as e:
+        print(f"WARNING: No Arduino found ({e}). Running preview-only.")
+        arduino = None
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+    last_send_time = 0
+    last_cmd = 'S'
+    
+    is_dumped = False   
+    is_blocked_by_sonar = False 
+    
+    # --- SMART SCAN STATE MACHINE VARIABLES ---
+    is_evading = False
+    evasion_stage = 0
+    evasion_timer = 0
+
+    while True:
+        # 1. READ FROM ARDUINO 
+        if arduino and arduino.in_waiting > 0:
+            try:
+                msg = arduino.readline().decode('utf-8').strip()
+                if msg == "BLOCKED":
+                    is_blocked_by_sonar = True
+                elif msg == "CLEAR":
+                    is_blocked_by_sonar = False
+            except:
+                pass
+
+        # 2. PROCESS CAMERA
+        ret, frame = cap.read()
+        if not ret: 
+            continue
+
+        h, w = frame.shape[:2]
+        roi = frame[int(h*0.5):h, 0:w]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # PURPLE (Drop Zone)
+        lower_purple = np.array([125, 70, 50])
+        upper_purple = np.array([160, 255, 255])
+        purple_mask = cv2.inRange(hsv, lower_purple, upper_purple)
+        
+        # BROWN (Cardboard Boxes)
+        brown_mask = cv2.inRange(hsv, np.array([10, 100, 20]), np.array([30, 255, 200]))
+
+        purple_area = cv2.countNonZero(purple_mask)
+        brown_area = cv2.countNonZero(brown_mask)
+
+        # 3. DECISION LOGIC
+        cmd = 'S'
+        status_text = ""
+
+        # Trigger the Smart Scan if blocked!
+        if is_blocked_by_sonar and not is_evading and not is_dumped:
+            is_evading = True
+            evasion_stage = 1
+            evasion_timer = time.time()
+            print("\n>>> OBSTACLE DETECTED! Starting Smart Scan...")
+
+        # Priority 1: Drop Zone
+        if not is_dumped and purple_area > 3000:
+            cmd = 'D'
+            is_dumped = True
+            is_evading = False 
+            status_text = "PURPLE ZONE -> DUMPING"
+            
+        # Priority 2: Waiting for Reset
+        elif is_dumped:
+            cmd = 'DUMPED'
+            status_text = "WAITING FOR RESET (Press X)"
+            
+        # Priority 3: The Smart Scan Sequence
+        elif is_evading:
+            elapsed = time.time() - evasion_timer
+            
+            if evasion_stage == 1:
+                cmd = 'B'
+                status_text = "SCAN: 1 - REVERSING"
+                if elapsed > 0.5:
+                    evasion_stage = 2
+                    evasion_timer = time.time()
+                    
+            elif evasion_stage == 2:
+                cmd = 'L'
+                status_text = "SCAN: 2 - LOOKING LEFT"
+                if elapsed > 0.6:  # <-- TUNE THIS NUMBER: Time it takes your rover to turn 90 degrees
+                    evasion_stage = 3
+                    evasion_timer = time.time()
+                    
+            elif evasion_stage == 3:
+                cmd = 'S'
+                status_text = "SCAN: 3 - CHECKING SONAR..."
+                if elapsed > 0.4:  # Wait 0.4s for the sensor to settle and read the room
+                    if not is_blocked_by_sonar:
+                        is_evading = False # Path is clear! Exit the scan and drive!
+                        print(">>> LEFT IS CLEAR! GOING!")
+                    else:
+                        evasion_stage = 4 # Still blocked, look the other way
+                        evasion_timer = time.time()
+                        
+            elif evasion_stage == 4:
+                cmd = 'R'
+                status_text = "SCAN: 4 - LOOKING RIGHT"
+                if elapsed > 1.2:  # <-- TUNE THIS NUMBER: Double the time of Stage 2 (180 degree turn)
+                    evasion_stage = 5
+                    evasion_timer = time.time()
+                    
+            elif evasion_stage == 5:
+                cmd = 'S'
+                status_text = "SCAN: 5 - CHECKING SONAR..."
+                if elapsed > 0.4:
+                    if not is_blocked_by_sonar:
+                        is_evading = False # Path is clear!
+                        print(">>> RIGHT IS CLEAR! GOING!")
+                    else:
+                        evasion_stage = 6 # Both sides blocked!
+                        evasion_timer = time.time()
+                        
+            elif evasion_stage == 6:
+                cmd = 'L'
+                status_text = "SCAN: 6 - TRAPPED! U-TURN!"
+                if elapsed > 0.6:  # Turn 90 degrees again to completely face away
+                    is_evading = False
+            
+        # Priority 4: Normal Driving (Camera Navigation)
+        else:
+            if brown_area > 2000:
+                M = cv2.moments(brown_mask)
+                if M["m00"] > 0:
+                    box_x = int(M["m10"] / M["m00"])
+                    if box_x > w // 2:
+                        cmd = 'L' 
+                        status_text = "BOX RIGHT -> TURN LEFT"
+                    else:
+                        cmd = 'R' 
+                        status_text = "BOX LEFT -> TURN RIGHT"
+            else:
+                cmd = 'F'
+                status_text = "PATH CLEAR -> FORWARD"
+
+        # 4. SEND COMMAND
+        now = time.time()
+        if arduino and (cmd != last_cmd or now - last_send_time > SEND_INTERVAL):
+            if cmd != 'DUMPED':
+                arduino.write(cmd.encode())
+            last_send_time = now
+            last_cmd = cmd
+
+        # 5. DEBUG VISUALS
+        cv2.putText(frame, f"CMD: {cmd} | {status_text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+        cv2.imshow("Maze View", frame)
+        cv2.imshow("Purple Mask", purple_mask)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('x'):
+            if is_dumped:
+                if arduino: arduino.write(b'X')
+                is_dumped = False
+
+    cap.release()
+    cv2.destroyAllWindows()
+    if arduino:
+        arduino.write(b'S') 
+        arduino.close()
+
+main()
