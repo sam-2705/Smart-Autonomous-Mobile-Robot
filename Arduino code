@@ -1,0 +1,222 @@
+/*
+  rover_motor_control_maze_LCD.ino
+  Smart Maze Solver with Momentum Fixes, HC-SR04, and I2C LCD Status.
+*/
+
+#include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// Initialize the LCD (0x27 is the standard address for a 16x2 I2C display)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Motor Pins
+const int ENA = 6;
+const int ENB = 3;
+const int IN1 = 8;
+const int IN2 = 9;
+const int IN3 = 10;
+const int IN4 = 11;
+
+const int SERVO_PIN = 5;
+const int SERVO_REST_ANGLE = 80; 
+const int SERVO_DUMP_ANGLE = 0;  
+
+const int TRIG_PIN = 12;
+const int ECHO_PIN = 7;
+
+// --- MOMENTUM FIXES ---
+const int STOP_DISTANCE_CM = 25; 
+const int BASE_SPEED = 120;      
+const int TURN_SPEED = 170;      
+
+Servo dumpServo;
+bool isDumped = false;   
+bool isBlocked = false; 
+
+int blockCounter = 0;
+int clearCounter = 0;
+const int REQUIRED_PINGS = 3; 
+
+// --- LCD State Tracking ---
+String currentAction = "READY";
+
+void setup() {
+  Serial.begin(9600);
+
+  // CRITICAL FIX: Prevent the I2C bus from freezing the Arduino due to motor noise
+  Wire.setWireTimeout(25000, true); 
+
+  // Setup LCD
+  lcd.init();
+  lcd.backlight();
+  updateDisplay(); // Show initial ready state
+
+  pinMode(ENA, OUTPUT);  pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT);  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);  pinMode(IN4, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+
+  dumpServo.attach(SERVO_PIN);
+  dumpServo.write(SERVO_REST_ANGLE);
+  stopMotors();
+}
+
+void loop() {
+  // 1. Sonar Check
+  long distance = getDistanceCM();
+  bool currentlyBlocked = (distance > 0 && distance < STOP_DISTANCE_CM);
+
+  // Debouncing filter
+  if (currentlyBlocked) {
+    blockCounter++;
+    clearCounter = 0;
+  } else {
+    clearCounter++;
+    blockCounter = 0;
+  }
+
+  // Trigger Blocked/Clear states
+  if (blockCounter >= REQUIRED_PINGS && !isBlocked) {
+    stopMotors(); 
+    isBlocked = true;
+    currentAction = "EMERGENCY BRAKE!";
+    Serial.println("BLOCKED");
+  } 
+  else if (clearCounter >= REQUIRED_PINGS && isBlocked) {
+    isBlocked = false;
+    Serial.println("CLEAR");
+  }
+
+  // 2. Serial Commands from Raspberry Pi
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+
+    switch (cmd) {
+      case 'F':
+        if (!isDumped && !isBlocked) {
+          forward(BASE_SPEED);
+          currentAction = "FORWARD";
+        }
+        break;
+      case 'B':
+        if (!isDumped) {
+          backward(BASE_SPEED);
+          currentAction = "REVERSING";
+        }
+        break;
+      case 'L':
+        if (!isDumped) {
+          turnLeft(TURN_SPEED);
+          currentAction = "TURNING LEFT";
+        }
+        break;
+      case 'R':
+        if (!isDumped) {
+          turnRight(TURN_SPEED);
+          currentAction = "TURNING RIGHT";
+        }
+        break;
+      case 'S':
+        stopMotors();
+        if (!isDumped && !isBlocked) {
+           currentAction = "STOPPED";
+        }
+        break;
+      case 'D':
+        if (!isDumped) {
+          tiltBedUp();
+          currentAction = "DUMPING PAYLOAD";
+        }
+        break;
+      case 'X':
+        if (isDumped) {
+          tiltBedDown();
+          currentAction = "BED LOWERED";
+        }
+        break;
+    }
+  }
+
+  // 3. Update the Screen
+  updateDisplay();
+
+  delay(10); 
+}
+
+// ---------- LCD Helper Function ----------
+
+void updateDisplay() {
+  // Static variables remember what was on the screen last loop.
+  // We ONLY update the screen if something actually changed.
+  static String lastAction = "";
+  static bool lastBlockState = false;
+  static bool firstRun = true;
+
+  if (currentAction != lastAction || isBlocked != lastBlockState || firstRun) {
+    
+    // LINE 1: Sonar Status
+    lcd.setCursor(0, 0);
+    if (isBlocked) {
+      lcd.print("Sonar: BLOCKED  "); // Spaces overwrite old text
+    } else {
+      lcd.print("Sonar: CLEAR    ");
+    }
+
+    // LINE 2: Motor/Rover Status
+    lcd.setCursor(0, 1);
+    String paddedAction = currentAction;
+    // Pad the string with empty spaces up to 16 characters 
+    // to cleanly wipe out whatever word was there previously
+    while (paddedAction.length() < 16) {
+      paddedAction += " ";
+    }
+    lcd.print(paddedAction);
+
+    // Save states for next check
+    lastAction = currentAction;
+    lastBlockState = isBlocked;
+    firstRun = false;
+  }
+}
+
+// ---------- Hardware Helper Functions ----------
+
+long getDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10); digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); 
+  if (duration == 0) return 999; 
+  return duration * 0.034 / 2;
+}
+
+void tiltBedUp() {
+  stopMotors();                     
+  dumpServo.write(SERVO_DUMP_ANGLE); 
+  isDumped = true;                  
+}
+
+void tiltBedDown() {
+  dumpServo.write(SERVO_REST_ANGLE); 
+  isDumped = false;                 
+}
+
+// Forward primitives
+void leftForward(int speed) { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); analogWrite(ENA, speed); }
+void rightForward(int speed) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, speed); }
+
+// Backward primitives
+void leftBackward(int speed) { digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, speed); }
+void rightBackward(int speed) { digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, speed); }
+
+// Stop primitives
+void leftStop() { digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); analogWrite(ENA, 0); }
+void rightStop() { digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); analogWrite(ENB, 0); }
+
+// High level moves
+void forward(int speed) { leftForward(speed); rightForward(speed); }
+void backward(int speed) { leftBackward(speed); rightBackward(speed); }
+void turnLeft(int speed) { leftBackward(speed); rightForward(speed); }
+void turnRight(int speed) { leftForward(speed); rightBackward(speed); } 
+void stopMotors() { leftStop(); rightStop(); }
